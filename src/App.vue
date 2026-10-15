@@ -1,16 +1,47 @@
 <script setup>
-import { computed, onMounted, ref, watch } from "vue";
+import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { starterHabits } from "./common/starterHabits.js";
-import WelcomeRow from "./components/WelcomeRow.vue";
+import PersonalDashboard from "./components/dashboard/PersonalDashboard.vue";
+import LandingPage from "./components/landing/LandingPage.vue";
+import {
+  supabase,
+  supabaseConfigAvailable,
+  supabaseConfigError,
+} from "./lib/supabase.js";
 
 const STORAGE_KEY = "little-by-little-habits";
+const MIN_FINISH_MINUTES = 1;
+const MAX_FINISH_DAYS = 30;
 const today = new Date();
 const todayKey = dateKey(today);
+const currentTime = ref(Date.now());
 const habits = ref([]);
 const newHabitName = ref("");
+const newHabitDeadline = ref(
+  toDateTimeLocal(new Date(Date.now() + 24 * 60 * 60 * 1000))
+);
+const minFinishAt = ref("");
+const maxFinishAt = ref("");
+const finishTimeError = ref("");
+const extendingHabitId = ref(null);
+const extendedDeadline = ref("");
+const extendTimeError = ref("");
 const editingHabitId = ref(null);
 const editingHabitName = ref("");
+const authUser = ref(null);
+const authLoading = ref(true);
+const authError = ref("");
+const syncError = ref("");
+const syncing = ref(false);
+const activeUserId = ref(null);
+const cloudReady = ref(false);
+const canUseTracker = computed(() => !authUser.value || cloudReady.value);
 const isReady = ref(false);
+let authSubscription;
+let saveQueue = Promise.resolve();
+let clockInterval;
+
+refreshFinishBounds();
 
 const dateLabel = new Intl.DateTimeFormat("en", {
   weekday: "long",
@@ -58,23 +89,267 @@ const weekProgress = computed(() => {
 });
 
 onMounted(() => {
-  try {
-    const savedHabits = localStorage.getItem(STORAGE_KEY);
-    habits.value = savedHabits ? JSON.parse(savedHabits) : starterHabits;
-    if (!Array.isArray(habits.value)) habits.value = starterHabits;
-  } catch {
-    habits.value = starterHabits;
-  }
-  isReady.value = true;
+  void initializeTracker();
+  clockInterval = window.setInterval(() => {
+    currentTime.value = Date.now();
+    const editingHabit = habits.value.find((habit) => habit.id === editingHabitId.value);
+    if (editingHabit && isExpired(editingHabit)) cancelEditing();
+  }, 1000);
+});
+
+onUnmounted(() => {
+  window.clearInterval(clockInterval);
+  authSubscription?.unsubscribe();
 });
 
 watch(
   habits,
   (value) => {
-    if (isReady.value) localStorage.setItem(STORAGE_KEY, JSON.stringify(value));
+    if (!isReady.value) return;
+
+    const userId = activeUserId.value;
+    try {
+      localStorage.setItem(
+        userId ? `${STORAGE_KEY}:${userId}` : STORAGE_KEY,
+        JSON.stringify(value)
+      );
+    } catch (error) {
+      syncError.value = `Could not save a local tracker copy: ${error.message}`;
+    }
+
+    if (userId && cloudReady.value && supabase) {
+      queueCloudSync(JSON.parse(JSON.stringify(value)), userId);
+    }
   },
   { deep: true }
 );
+
+async function initializeTracker() {
+  if (!supabase) {
+    habits.value = readLocalHabits(STORAGE_KEY) || starterHabits;
+    isReady.value = true;
+    authLoading.value = false;
+    return;
+  }
+
+  try {
+    const { data, error } = await supabase.auth.getSession();
+    if (error) throw error;
+
+    await applySession(data.session);
+    const { data: authState } = supabase.auth.onAuthStateChange((_event, session) => {
+      queueMicrotask(() => void applySession(session));
+    });
+    authSubscription = authState.subscription;
+  } catch (error) {
+    authError.value = `Could not initialize Supabase: ${error.message}`;
+    habits.value = readLocalHabits(STORAGE_KEY) || starterHabits;
+    isReady.value = true;
+    authLoading.value = false;
+  }
+}
+
+function readLocalHabits(key) {
+  try {
+    const savedHabits = localStorage.getItem(key);
+    if (!savedHabits) return null;
+    const parsedHabits = JSON.parse(savedHabits);
+    if (Array.isArray(parsedHabits)) return parsedHabits;
+    console.warn(`Ignoring invalid saved tracker data in ${key}.`);
+  } catch (error) {
+    console.error(`Could not read saved tracker data in ${key}.`, error);
+  }
+  return null;
+}
+
+async function applySession(session, forceReload = false) {
+  const user = session?.user || null;
+  const userId = user?.id || null;
+  if (!forceReload && userId === activeUserId.value && isReady.value) {
+    authUser.value = user;
+    return;
+  }
+
+  authLoading.value = true;
+  authError.value = "";
+  syncError.value = "";
+  cloudReady.value = false;
+  isReady.value = false;
+  activeUserId.value = userId;
+  authUser.value = user;
+  habits.value = [];
+
+  if (!user) {
+    habits.value = readLocalHabits(STORAGE_KEY) || starterHabits;
+    isReady.value = true;
+    authLoading.value = false;
+    return;
+  }
+
+  try {
+    const { data: profile, error } = await supabase
+      .from("profiles")
+      .select("id")
+      .eq("id", user.id)
+      .maybeSingle();
+
+    if (activeUserId.value !== user.id) return;
+    if (error) throw error;
+
+    if (!profile) {
+      const { error: createError } = await supabase
+        .from("profiles")
+        .upsert(profileRecord(user), { onConflict: "id" });
+      if (activeUserId.value !== user.id) return;
+      if (createError) throw createError;
+    }
+
+    const { data: habitRows, error: habitsError } = await supabase
+      .from("habits")
+      .select("id, name, icon, color, completions, expected_finish_at")
+      .eq("user_id", user.id)
+      .order("created_at", { ascending: true });
+    if (activeUserId.value !== user.id) return;
+    if (habitsError) throw habitsError;
+
+    if (habitRows.length) {
+      habits.value = habitRows.map(habitFromRow);
+    } else {
+      const initialHabits = profile
+        ? []
+        : readLocalHabits(`${STORAGE_KEY}:${user.id}`) ||
+          readLocalHabits(STORAGE_KEY) ||
+          starterHabits;
+      if (initialHabits.length) {
+        const { error: seedError } = await supabase
+          .from("habits")
+          .insert(initialHabits.map((habit) => habitToRow(user.id, habit)));
+        if (activeUserId.value !== user.id) return;
+        if (seedError) throw seedError;
+      }
+      habits.value = initialHabits;
+    }
+
+    cloudReady.value = true;
+    isReady.value = true;
+    authLoading.value = false;
+  } catch (error) {
+    if (activeUserId.value !== user.id) return;
+    habits.value = [];
+    authError.value = `Could not load your profile: ${error.message}`;
+    isReady.value = true;
+    authLoading.value = false;
+  }
+}
+
+function profileRecord(user) {
+  const metadata = user?.user_metadata || {};
+  return {
+    id: user.id,
+    display_name: metadata.full_name || metadata.name || user.email || null,
+    avatar_url: metadata.avatar_url || metadata.picture || null,
+    updated_at: new Date().toISOString(),
+  };
+}
+
+function habitFromRow(row) {
+  return {
+    id: row.id,
+    name: row.name,
+    icon: row.icon,
+    color: row.color,
+    completions: row.completions || [],
+    expectedFinishAt: row.expected_finish_at,
+  };
+}
+
+function habitToRow(userId, habit) {
+  return {
+    user_id: userId,
+    id: String(habit.id),
+    name: habit.name,
+    icon: habit.icon,
+    color: habit.color,
+    completions: habit.completions || [],
+    expected_finish_at: habit.expectedFinishAt || null,
+    updated_at: new Date().toISOString(),
+  };
+}
+
+function queueCloudSync(habitsSnapshot, userId) {
+  saveQueue = saveQueue.then(async () => {
+    if (
+      activeUserId.value !== userId ||
+      !cloudReady.value ||
+      !supabase ||
+      habitsSnapshot.length === 0
+    ) {
+      return;
+    }
+    syncing.value = true;
+    try {
+      const { error } = await supabase
+        .from("habits")
+        .upsert(habitsSnapshot.map((habit) => habitToRow(userId, habit)), {
+          onConflict: "user_id,id",
+        });
+      if (activeUserId.value === userId) {
+        syncError.value = error ? `Could not sync tracker: ${error.message}` : "";
+      }
+    } catch (error) {
+      if (activeUserId.value === userId) {
+        syncError.value = `Could not sync tracker: ${error.message}`;
+      }
+    } finally {
+      syncing.value = false;
+    }
+  });
+  return saveQueue;
+}
+
+async function signInWithGoogle() {
+  if (!supabase) return;
+  authLoading.value = true;
+  authError.value = "";
+  try {
+    const { error } = await supabase.auth.signInWithOAuth({
+      provider: "google",
+      options: { redirectTo: window.location.origin },
+    });
+    if (error) throw error;
+  } catch (error) {
+    authError.value = `Google sign-in failed: ${error.message}`;
+    authLoading.value = false;
+  }
+}
+
+async function signOut() {
+  if (!supabase) return;
+  authLoading.value = true;
+  await saveQueue;
+  try {
+    const { error } = await supabase.auth.signOut();
+    if (error) throw error;
+  } catch (error) {
+    authError.value = `Could not sign out: ${error.message}`;
+    authLoading.value = false;
+  }
+}
+
+async function retryProfileLoad() {
+  if (!supabase) return;
+  if (activeUserId.value && authUser.value) {
+    await applySession({ user: authUser.value }, true);
+  } else {
+    try {
+      const { data, error } = await supabase.auth.getSession();
+      if (error) throw error;
+      await applySession(data.session, true);
+    } catch (error) {
+      authError.value = `Could not check your sign-in status: ${error.message}`;
+    }
+  }
+}
 
 function dateKey(date) {
   const year = date.getFullYear();
@@ -83,15 +358,58 @@ function dateKey(date) {
   return `${year}-${month}-${day}`;
 }
 
+function toDateTimeLocal(date) {
+  const localDate = new Date(date.getTime() - date.getTimezoneOffset() * 60_000);
+  return localDate.toISOString().slice(0, 16);
+}
+
+function refreshFinishBounds() {
+  const now = Date.now();
+  const earliestMinute =
+    Math.ceil((now + MIN_FINISH_MINUTES * 60_000) / 60_000) * 60_000;
+  const latestMinute =
+    Math.floor((now + MAX_FINISH_DAYS * 24 * 60 * 60_000) / 60_000) * 60_000;
+  minFinishAt.value = toDateTimeLocal(new Date(earliestMinute));
+  maxFinishAt.value = toDateTimeLocal(new Date(latestMinute));
+}
+
+function formatExpectedFinish(value) {
+  return new Intl.DateTimeFormat("en", {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  }).format(new Date(value));
+}
+
+function isExpired(habit) {
+  const now = Math.max(currentTime.value, Date.now());
+  return Boolean(habit.expectedFinishAt) && Date.parse(habit.expectedFinishAt) <= now;
+}
+
 function toggleHabit(habit) {
+  if (!canUseTracker.value || isExpired(habit)) return;
   const index = habit.completions.indexOf(todayKey);
   if (index === -1) habit.completions.push(todayKey);
   else habit.completions.splice(index, 1);
 }
 
 function addHabit() {
+  if (!canUseTracker.value) return;
   const name = newHabitName.value.trim();
   if (!name) return;
+
+  const finishAt = new Date(newHabitDeadline.value).getTime();
+  const now = Date.now();
+  if (
+    !Number.isFinite(finishAt) ||
+    finishAt < now + MIN_FINISH_MINUTES * 60_000 ||
+    finishAt > now + MAX_FINISH_DAYS * 24 * 60 * 60_000
+  ) {
+    finishTimeError.value = "Choose a finish time between 1 minute and 30 days from now.";
+    refreshFinishBounds();
+    return;
+  }
 
   const colors = ["blue", "orange", "green", "pink"];
   const icons = ["✳", "◌", "⌁", "✦"];
@@ -102,11 +420,16 @@ function addHabit() {
     icon: icons[nextIndex % icons.length],
     color: colors[nextIndex % colors.length],
     completions: [],
+    expectedFinishAt: new Date(finishAt).toISOString(),
   });
   newHabitName.value = "";
+  finishTimeError.value = "";
+  refreshFinishBounds();
+  newHabitDeadline.value = toDateTimeLocal(new Date(Date.now() + 24 * 60 * 60 * 1000));
 }
 
 function startEditing(habit) {
+  if (!canUseTracker.value || isExpired(habit)) return;
   editingHabitId.value = habit.id;
   editingHabitName.value = habit.name;
 }
@@ -117,6 +440,7 @@ function cancelEditing() {
 }
 
 function saveHabitEdit(habit) {
+  if (!canUseTracker.value || isExpired(habit)) return;
   const name = editingHabitName.value.trim();
   if (!name) return;
 
@@ -124,209 +448,137 @@ function saveHabitEdit(habit) {
   cancelEditing();
 }
 
-function deleteHabit(id) {
+function startExtending(habit) {
+  if (!canUseTracker.value || !isExpired(habit)) return;
+  refreshFinishBounds();
+  extendingHabitId.value = habit.id;
+  extendedDeadline.value = minFinishAt.value;
+  extendTimeError.value = "";
+}
+
+function cancelExtending() {
+  extendingHabitId.value = null;
+  extendedDeadline.value = "";
+  extendTimeError.value = "";
+}
+
+function saveExtension(habit) {
+  if (!canUseTracker.value || !isExpired(habit)) return;
+
+  const finishAt = new Date(extendedDeadline.value).getTime();
+  const now = Date.now();
+  if (
+    !Number.isFinite(finishAt) ||
+    finishAt < now + MIN_FINISH_MINUTES * 60_000 ||
+    finishAt > now + MAX_FINISH_DAYS * 24 * 60 * 60_000
+  ) {
+    extendTimeError.value = "Choose a finish time between 1 minute and 30 days from now.";
+    refreshFinishBounds();
+    return;
+  }
+
+  habit.expectedFinishAt = new Date(finishAt).toISOString();
+  cancelExtending();
+}
+
+async function deleteHabit(id) {
+  const habit = habits.value.find((item) => item.id === id);
+  if (!canUseTracker.value || (habit && isExpired(habit))) return;
+
+  const userId = activeUserId.value;
+  if (userId && supabase) {
+    await saveQueue;
+    if (activeUserId.value !== userId) return;
+    syncing.value = true;
+    try {
+      const { error } = await supabase
+        .from("habits")
+        .delete()
+        .eq("user_id", userId)
+        .eq("id", String(id));
+      if (error) {
+        syncError.value = `Could not delete habit: ${error.message}`;
+        return;
+      }
+    } catch (error) {
+      syncError.value = `Could not delete habit: ${error.message}`;
+      return;
+    } finally {
+      syncing.value = false;
+    }
+  }
+
   habits.value = habits.value.filter((habit) => habit.id !== id);
   if (editingHabitId.value === id) cancelEditing();
+}
+
+function clearFinishTimeError() {
+  finishTimeError.value = "";
+}
+
+function clearExtendTimeError() {
+  extendTimeError.value = "";
 }
 </script>
 
 <template>
-  <div class="app-shell">
-    <header class="topbar">
-      <!-- <a class="brand" href="#top" aria-label="Little by Little home">
-        <span class="brand-mark" aria-hidden="true">l.</span>
-        <span>little by little</span>
-      </a> -->
-      <div class="topbar-date"><span class="date-dot"></span>{{ dateLabel }}</div>
-      <!-- <div class="avatar" aria-label="Your habit space">Y</div> -->
-    </header>
-
-    <main id="top" class="dashboard">
-      <WelcomeRow
-        :habits="habits"
-        :completed-count="completedCount"
-        :remaining-count="remainingCount"
-        :progress="progress"
-      />
-
-      <section class="stats-row" aria-label="Your habit summary">
-        <div class="stat-item">
-          <span class="stat-icon streak-icon" aria-hidden="true">✳</span>
-          <span class="stat-copy"
-            ><strong>{{ streak }} days</strong><small>current streak</small></span
-          >
-        </div>
-        <span class="stat-divider" aria-hidden="true"></span>
-        <div class="stat-item">
-          <span class="stat-icon week-icon" aria-hidden="true">↗</span>
-          <span class="stat-copy"
-            ><strong>{{ weekProgress }}%</strong><small>this week</small></span
-          >
-        </div>
-        <span class="stats-message">Consistency over intensity</span>
-      </section>
-
-      <div class="content-grid">
-        <section class="habits-section" aria-labelledby="habits-heading">
-          <div class="section-heading">
-            <div>
-              <p class="eyebrow">SHOW UP FOR YOURSELF</p>
-              <h2 id="habits-heading">
-                Today's habits <span>{{ habits.length }}</span>
-              </h2>
-            </div>
-            <!-- <span class="section-date">{{ dateLabel }}</span> -->
-          </div>
-
-          <div v-if="habits.length" class="habit-list">
-            <article
-              v-for="(habit, index) in habits"
-              :key="habit.id"
-              class="habit-row"
-              :class="{ 'is-complete': habit.completions.includes(todayKey) }"
-              :style="{ '--row-index': index }"
-            >
-              <span
-                class="habit-icon"
-                :class="`tone-${habit.color}`"
-                aria-hidden="true"
-                >{{ habit.icon }}</span
-              >
-              <div class="habit-info">
-                <form
-                  v-if="editingHabitId === habit.id"
-                  class="edit-form"
-                  @submit.prevent="saveHabitEdit(habit)"
-                >
-                  <label class="visually-hidden" :for="`edit-habit-${habit.id}`">
-                    Edit {{ habit.name }}
-                  </label>
-                  <input
-                    :id="`edit-habit-${habit.id}`"
-                    v-model="editingHabitName"
-                    class="edit-input"
-                    maxlength="60"
-                    required
-                    autocomplete="off"
-                    @keydown.esc.prevent="cancelEditing"
-                  />
-                  <button class="edit-action save-edit" type="submit">Save</button>
-                  <button
-                    class="edit-action cancel-edit"
-                    type="button"
-                    @click="cancelEditing"
-                  >
-                    Cancel
-                  </button>
-                </form>
-                <template v-else>
-                  <span class="habit-name">{{ habit.name }}</span>
-                  <span class="habit-meta"
-                    >{{ habit.completions.length }}
-                    {{ habit.completions.length === 1 ? "day" : "days" }} practiced</span
-                  >
-                </template>
-              </div>
-              <button
-                v-if="editingHabitId !== habit.id"
-                class="edit-button"
-                type="button"
-                :aria-label="`Edit ${habit.name}`"
-                @click="startEditing(habit)"
-              >
-                <svg viewBox="0 0 20 20" aria-hidden="true">
-                  <path
-                    d="m12.8 4.2 3 3M4 16l3.5-.8 8.8-8.8a1.4 1.4 0 0 0-2-2l-8.8 8.8L4 16Z"
-                  />
-                </svg>
-              </button>
-              <button
-                class="check-button"
-                :class="{ checked: habit.completions.includes(todayKey) }"
-                type="button"
-                :aria-label="`${
-                  habit.completions.includes(todayKey) ? 'Mark' : 'Complete'
-                } ${habit.name} ${
-                  habit.completions.includes(todayKey) ? 'incomplete' : 'complete'
-                }`"
-                :aria-pressed="habit.completions.includes(todayKey)"
-                :disabled="editingHabitId === habit.id"
-                @click="toggleHabit(habit)"
-              >
-                <svg
-                  v-if="habit.completions.includes(todayKey)"
-                  viewBox="0 0 20 20"
-                  aria-hidden="true"
-                >
-                  <path d="m5 10 3.2 3.2L15.5 6" />
-                </svg>
-                <span v-else class="check-label">Done</span>
-              </button>
-              <button
-                class="delete-button"
-                type="button"
-                :aria-label="`Delete ${habit.name}`"
-                @click="deleteHabit(habit.id)"
-              >
-                <svg viewBox="0 0 20 20" aria-hidden="true">
-                  <path d="M4.5 6h11M8 6V4.5h4V6m2.5 0-.6 9.5H6.1L5.5 6m3 2.5v4m3-4v4" />
-                </svg>
-              </button>
-            </article>
-          </div>
-
-          <div v-else class="empty-state">
-            <span class="empty-spark" aria-hidden="true">✳</span>
-            <h3>A fresh page.</h3>
-            <p>Add one small thing you want to make part of your day.</p>
-          </div>
-
-          <p class="list-footnote">
-            <span class="footnote-spark" aria-hidden="true">✳</span> Every check-in
-            counts. Keep your promises small and kind.
-          </p>
-        </section>
-
-        <aside class="side-column">
-          <section class="add-card" aria-labelledby="add-heading">
-            <div class="add-heading-row">
-              <!-- <span class="add-mark" aria-hidden="true">+</span> -->
-              <div>
-                <p class="eyebrow">MAKE IT A RITUAL</p>
-                <h2 id="add-heading">Add a habit</h2>
-              </div>
-            </div>
-            <form class="add-form" @submit.prevent="addHabit">
-              <label class="visually-hidden" for="habit-name">Habit name</label>
-              <input
-                id="habit-name"
-                v-model="newHabitName"
-                maxlength="60"
-                placeholder="e.g. Stretch for 5 minutes"
-                autocomplete="off"
-              />
-              <button
-                type="submit"
-                :disabled="!newHabitName.trim()"
-                aria-label="Add habit"
-              >
-                <span>+</span>
-              </button>
-            </form>
-            <p class="form-hint">Start small. You can always grow from here.</p>
-          </section>
-
-          <section class="note-card" aria-label="A gentle reminder">
-            <span class="note-quote" aria-hidden="true">“</span>
-            <p>Sic parvis magna</p>
-            <span class="note-attribution">Sir Francis Drake</span>
-          </section>
-        </aside>
-      </div>
-
-      <footer class="page-footer">
-        <span>GENWEB SOLUTIONS</span>
-      </footer>
-    </main>
+  <div v-if="authLoading && !authUser" class="auth-loading" role="status">
+    <span class="auth-loading-mark" aria-hidden="true">l.</span>
+    <span>Preparing your habit space...</span>
   </div>
+  <LandingPage
+    v-else-if="!authUser"
+    :configured="supabaseConfigAvailable"
+    :config-error="supabaseConfigError"
+    :auth-error="authError"
+    :loading="authLoading"
+    @login="signInWithGoogle"
+    @retry="retryProfileLoad"
+  />
+  <PersonalDashboard
+    v-else
+    :user="authUser"
+    :syncing="syncing"
+    :auth-error="authError"
+    :sync-error="syncError"
+    :date-label="dateLabel"
+    :habits="habits"
+    :completed-count="completedCount"
+    :remaining-count="remainingCount"
+    :progress="progress"
+    :streak="streak"
+    :week-progress="weekProgress"
+    :today-key="todayKey"
+    :can-use-tracker="canUseTracker"
+    :is-expired="isExpired"
+    :format-expected-finish="formatExpectedFinish"
+    :editing-habit-id="editingHabitId"
+    :editing-habit-name="editingHabitName"
+    :extending-habit-id="extendingHabitId"
+    :extended-deadline="extendedDeadline"
+    :extend-time-error="extendTimeError"
+    :min-finish-at="minFinishAt"
+    :max-finish-at="maxFinishAt"
+    :new-habit-name="newHabitName"
+    :new-habit-deadline="newHabitDeadline"
+    :finish-time-error="finishTimeError"
+    @logout="signOut"
+    @retry="retryProfileLoad"
+    @toggle-habit="toggleHabit"
+    @add-habit="addHabit"
+    @start-editing="startEditing"
+    @cancel-editing="cancelEditing"
+    @save-habit-edit="saveHabitEdit"
+    @delete-habit="deleteHabit"
+    @start-extending="startExtending"
+    @cancel-extending="cancelExtending"
+    @save-extension="saveExtension"
+    @refresh-finish-bounds="refreshFinishBounds"
+    @clear-finish-time-error="clearFinishTimeError"
+    @clear-extend-time-error="clearExtendTimeError"
+    @update-new-habit-name="newHabitName = $event"
+    @update-new-habit-deadline="newHabitDeadline = $event"
+    @update-editing-habit-name="editingHabitName = $event"
+    @update-extended-deadline="extendedDeadline = $event"
+  />
 </template>

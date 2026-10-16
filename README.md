@@ -1,18 +1,17 @@
-# Habit Tracker
+# Debt Tracker
 
-A Vue habit tracker with Supabase profiles and Google sign-in. Without
-Supabase configuration, the app shows the public landing page and Google
-sign-in remains unavailable. The personal dashboard is shown only to signed-in
-users.
+A Vue debt tracker with Supabase profiles and Google sign-in. The public
+landing page is available to everyone; the personal dashboard and debt records
+are available only after signing in.
 
 ## Supabase and Google setup
 
 1. In the Supabase SQL Editor, run (or re-run)
-   [`supabase/schema.sql`](./supabase/schema.sql). It creates the `habits` table,
-   enables row level security so users can only read and change their own rows,
-   and migrates existing habits from the `profiles.habits` JSON field without
-   overwriting rows already in `habits`. After copying, the old JSON field is
-   emptied so deleted habits cannot be restored from stale profile data.
+   [`supabase/schema.sql`](./supabase/schema.sql). It creates the
+   `public.debts` table and row-level security policies so each signed-in user
+   can only read and change their own debt records. The script also retains the
+   earlier profile and habits schema for existing data; old habits are not
+   converted into debt records.
 2. In Google Cloud Console, create an OAuth client ID for a web application.
    In Supabase **Authentication → Providers → Google**, enable Google and enter
    the client ID and client secret. Add the exact callback URL shown by Supabase
@@ -29,11 +28,11 @@ users.
    frontend environment variable.
 5. Restart the Vite development server, then choose **Continue with Google**.
 
-Habits load from the signed-in user's rows in `public.habits`; the database is
-the source of truth and Supabase row level security prevents access to another
-user's habits. On first sign-in, an existing browser-local tracker is copied
-into a new account when that account has no saved habits. A per-user local cache
-is also kept for continuity.
+Each debt record stores the debtor's name, amount owed, and expected payment
+date. Amounts are displayed without a currency symbol; use the same currency
+for every record so the outstanding total is meaningful. Existing habit data
+is retained in the legacy database tables but is not displayed or migrated
+into debts.
 
 ## Development
 

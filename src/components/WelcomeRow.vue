@@ -1,56 +1,28 @@
 <script setup>
-const { habits, completedCount, remainingCount, progress } = defineProps({
-  habits: {
-    type: Array,
-    required: true,
-  },
-  completedCount: {
-    type: Number,
-    required: true,
-  },
-  remainingCount: {
-    type: Number,
-    required: true,
-  },
-  progress: {
-    type: Number,
-    required: true,
-  },
+defineProps({
+  debtorCount: { type: Number, required: true },
+  totalOwed: { type: Number, required: true },
+  formatAmount: { type: Function, required: true },
 });
 </script>
 
 <template>
-  <section class="welcome-row" aria-labelledby="page-title">
+  <section class="welcome-row debt-welcome" aria-labelledby="page-title">
     <div class="welcome-copy">
-      <p class="eyebrow">YOUR DAILY PRACTICE <span>·</span></p>
-      <h1 id="page-title">Personal Habit<br /><em>Tracker</em></h1>
-      <!-- <p class="welcome-note">Small things, done often, make a life.</p> -->
+      <p class="eyebrow">YOUR PRIVATE ACCOUNT OVERVIEW</p>
+      <h1 id="page-title">Personal Debt<br /><em>Tracker</em></h1>
+      <p class="welcome-note">Keep track of who owes you, how much, and when they expect to pay.</p>
     </div>
 
-    <div class="progress-card" aria-label="Today's progress">
+    <div class="progress-card debt-overview-card" aria-label="Outstanding debt overview">
       <div class="progress-copy">
-        <span class="card-kicker">TODAY'S PROGRESS</span>
-        <strong>{{ completedCount }} <span>of</span> {{ habits.length }}</strong>
+        <span class="card-kicker">TOTAL OUTSTANDING</span>
+        <strong>{{ formatAmount(totalOwed) }}</strong>
         <span class="progress-caption">
-          {{
-            remainingCount === 0 && habits.length
-              ? "You showed up for yourself."
-              : `${remainingCount} ${
-                  remainingCount === 1 ? "habit" : "habits"
-                } left today`
-          }}
+          {{ debtorCount }} {{ debtorCount === 1 ? "debt record" : "debt records" }}
         </span>
       </div>
-      <div
-        class="progress-ring"
-        :style="{ '--progress': `${progress * 3.6}deg` }"
-        role="img"
-        :aria-label="`${progress}% complete`"
-      >
-        <div class="progress-ring-inner">
-          <span>{{ progress }}<small>%</small></span>
-        </div>
-      </div>
+      <div class="debt-overview-mark" aria-hidden="true">$</div>
     </div>
   </section>
 </template>

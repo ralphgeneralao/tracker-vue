@@ -394,3 +394,46 @@ button:focus-visible, input:focus-visible, a:focus-visible {
   .landing-feature h2 { margin: 6px 0 4px; }
   .landing-footer { align-items: flex-start; flex-direction: column; justify-content: center; gap: 5px; }
 }
+
+.debt-welcome .welcome-note { max-width: 430px; line-height: 1.7; }
+.debt-overview-card { width: 340px; }
+.debt-overview-card .progress-copy strong { font-size: clamp(21px, 3vw, 29px); overflow-wrap: anywhere; }
+.debt-overview-mark { width: 64px; height: 64px; flex: 0 0 64px; display: grid; place-items: center; border-radius: 50%; color: #557c64; background: #e8f0e8; font-size: 27px; font-weight: 600; }
+.debt-list { overflow: hidden; border: 1px solid #e4e9e2; border-radius: 5px; background: rgba(253, 254, 251, 0.88); }
+.debt-row { min-height: 76px; padding: 12px 14px; display: flex; align-items: center; gap: 11px; border-bottom: 1px solid #edf0eb; animation: rise-in 420ms both; animation-delay: calc(var(--row-index) * 55ms); }
+.debt-row:last-child { border-bottom: 0; }
+.debt-row:hover { background: #f9fbf7; }
+.debt-icon { width: 38px; height: 38px; flex: 0 0 38px; display: grid; place-items: center; border-radius: 12px; color: #5d806b; background: #eaf1e9; font-size: 17px; font-weight: 600; }
+.debt-info { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 5px; }
+.debt-name { overflow-wrap: anywhere; color: #39463f; font-size: 12px; font-weight: 600; }
+.debt-meta { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; color: #89948d; font-size: 9px; }
+.debt-amount { color: #34413a; font-size: 12px; white-space: nowrap; }
+.overdue-label { padding: 3px 6px; border-radius: 10px; color: #a64f43; background: #f8eae6; font-size: 8px; font-weight: 700; }
+.debt-edit-form { width: 100%; display: grid; grid-template-columns: minmax(100px, 1.5fr) minmax(80px, 1fr) minmax(130px, 1.2fr) auto auto; gap: 6px; }
+.debt-edit-form input { min-width: 0; height: 30px; padding: 0 7px; border: 1px solid #dfe6de; border-radius: 3px; color: #39463f; background: #fff; font-size: 10px; }
+.debt-add-form { align-items: end; }
+.debt-add-form input[type="date"] { width: 100%; }
+.debt-total-card { display: flex; flex-direction: column; align-items: flex-start; }
+.debt-total-card p { margin-bottom: 6px; }
+.debt-total-card strong { position: relative; color: #405e4b; font-size: 24px; overflow-wrap: anywhere; }
+.debt-count-icon { color: #bb765f; background: #f7ebe4; font-weight: 700; }
+.debt-row .edit-button { width: auto; flex: 0 0 auto; padding: 0 7px; color: #668070; font-size: 10px; opacity: 0.8; }
+.debt-row:hover .edit-button { opacity: 1; }
+.debt-row .edit-button:disabled { opacity: 0.35; }
+.debt-row:hover .delete-button, .delete-button:focus-visible { opacity: 1; }
+.list-footnote { line-height: 1.6; }
+
+@media (max-width: 760px) {
+  .debt-overview-card { width: 100%; }
+  .debt-edit-form { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+  .debt-edit-form input:first-of-type { grid-column: span 2; }
+}
+
+@media (max-width: 430px) {
+  .debt-row { padding: 10px; gap: 7px; }
+  .debt-icon { width: 34px; height: 34px; flex-basis: 34px; }
+  .debt-name { font-size: 11px; }
+  .debt-amount { font-size: 10px; }
+  .debt-edit-form { grid-template-columns: minmax(0, 1fr); }
+  .debt-edit-form input:first-of-type { grid-column: auto; }
+}
